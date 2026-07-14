@@ -1,0 +1,34 @@
+{
+  "stage": "search",
+  "status": "completed",
+  "duration_seconds": 75.88050300000032,
+  "log_file": "logs\\run_20260714_042649_search.log",
+  "mse_definition": "variance / floor(total_cnot_budget / cx_per_shot) + bias_squared",
+  "report_cnot_budgets": [
+    1000.0,
+    10000.0,
+    100000.0
+  ],
+  "primary_cnot_budget": 10000.0,
+  "transpiler_seed": 31,
+  "ensemble_seed": 17,
+  "search_seed": 23,
+  "cpu_thread_limits": {
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "XLA_FLAGS": "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
+  },
+  "platform": "Windows-10-10.0.19045-SP0",
+  "python": "3.12.4",
+  "packages": {
+    "tensorcircuit": "0.12.0",
+    "jax": "0.5.0",
+    "jaxlib": "0.5.0",
+    "numpy": "1.26.4",
+    "scipy": "1.13.1",
+    "matplotlib": "3.8.4",
+    "qiskit": "1.2.4"
+  }
+}

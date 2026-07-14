@@ -1,0 +1,46 @@
+{
+  "status": "passed",
+  "checks": {
+    "resource_rows": 6,
+    "jordan_dilation_vs_split_mse_ratio": {
+      "1000": 1.3387912393509966,
+      "10000": 1.5261659181083584,
+      "100000": 1.5548946313581178
+    },
+    "sensitivity_raw_rows": 64,
+    "sensitivity_budget_rows": 192,
+    "ensemble_raw_rows": 768,
+    "ensemble_budget_rows": 2304,
+    "search_summary_rows": 21,
+    "search_candidate_rows": 123,
+    "search_trial_rows": 2016
+  },
+  "errors": [],
+  "sha256": {
+    "data\\budgeted_search_candidate_stats.csv": "fe9ab23b4c6e95ab8f270041914bab8554228a54727e808bd46245d14585247a",
+    "data\\budgeted_search_summary.csv": "119c82dadbb857721a07b3b670adcfaa1426918d85bbaac26382016616008978",
+    "data\\budgeted_search_trials.csv": "c9e5e83c589abbda36f56f66e8228568e6a76ccbb4589167b85eacf360b98fce",
+    "data\\gate_level_budget_curves.csv": "106e94b6b044a2fadab30fe29f8a2828fba7a68b4bc8b22fd6c97aa4ce1b496f",
+    "data\\gate_level_resource_summary.csv": "367fe733867a79b12930d7e7a13cf44ae6c87ac0663a368a4f80ace6869e8375",
+    "data\\gate_level_sensitivity_budget_metrics.csv": "22acd2651f456e00cd03f0f2140a0221d6d2b3cd769ac01074e173d1e62749e2",
+    "data\\gate_level_sensitivity_budget_summary.csv": "7929485bdc5cd39d9100895affd8c3214a8a8b811868f0ffe5d1069dfe5e4ef3",
+    "data\\gate_level_sensitivity_raw.csv": "5cbf08661ee3b67a37ca37d5229573a8995dd09c4d6a771998ebdb105ddbcdfd",
+    "data\\operator_ensemble_budget_metrics.csv": "70e4bf2a8f4b7169b1cbb2746249e24eb6d22c65b20fd924d0b474f9284db418",
+    "data\\operator_ensemble_budget_summary.csv": "8731348d6682201f92df2167560b6c9e4b9aa7d9e1789741bfe708045e9bffb9",
+    "data\\operator_ensemble_raw.csv": "76f6f902eae5d71e3a46594b27177e8af367287d53b7ee1383227e9d6f5b1608",
+    "data\\run_metadata_baseline.json": "4b97fe572f42600801d7f4b747b73cf3fc18198c155a3f0d0c613da03b4fd806",
+    "data\\run_metadata_ensemble.json": "6f47a4f043305e88d55ebfc79e8f8e7e173ae5a18341e5dbf04e8b40a39fe24f",
+    "data\\run_metadata_plot-all.json": "3bb33b241e75cfd3f04454d757a81f6fc2052d760b73fc61f43140640437d4e6",
+    "data\\run_metadata_search.json": "f6d6417532acf7e2fb9ef571e9012d039054154ab2f5620986f3524105ad7350",
+    "data\\run_metadata_sensitivity.json": "b87d69adbd0644a3226bd6b7c8c45299b3157161bfe9f87601b995e91be4567e",
+    "figures\\Figure_0_Overview.pdf": "8c9cbded0a3c8ac7a19b0bbf78d1e1175e2f13680d14a1c282ccf85319398be3",
+    "figures\\Figure_0_Overview.vsdx": "50ba4a787a021a673adfb2d9d926aa645396107fbc8a7c331db6129e6734128a",
+    "figures\\Figure_1_Variance_Bound.pdf": "84e4b7b85ea4205f017351b82e985020fee228b9f3497d2ab84cf5cedf35da72",
+    "figures\\Figure_3_Breakeven.pdf": "a06117c7c3d096ae1bc3023fedecd59edea14effdf49d0eb4caf524d1afa6dd1",
+    "figures\\Figure_4_GateLevel_EndToEnd.pdf": "56f916e8a55da3a2fb64ea04f2e70ce296cff9838e29c629e98a4a4bf6c3f3ea",
+    "figures\\Figure_5_GateLevel_Sensitivity.pdf": "2539be1400921b512e53b5ee2f4caf345633d32ce4e8e7ecc647979af94f9e08",
+    "figures\\Figure_6_Ensemble_PhaseDiagram.pdf": "bcc70dff5002dc3dc12e7a6292c20a21f2993224d22061039b8c128f872bb46f",
+    "figures\\Figure_7_Compiled_Predictors.pdf": "6c84a4f356ee33a909808278f71ae86df30b2a476fff7a7005da4eb9874ddc05",
+    "figures\\Figure_8_Search_Workflow.pdf": "d4b54016880fe6320742eac604dca45866f9f5afaea4eebdd3ac8ad86d39e144"
+  }
+}

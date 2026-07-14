@@ -1,23 +1,29 @@
-# Repository manifest
-
-This file lists the contents of the public reproducibility artifact.
+# Minimal corrected release manifest
 
 ## Scripts
 
-- `scripts/generate_figures.py` - regenerates `Figure_1_Variance_Bound` and `Figure_3_Breakeven`.
-- `scripts/gate_level_benchmark.py` - regenerates `Figure_4_GateLevel_EndToEnd`, `Figure_5_GateLevel_Sensitivity`, `Figure_6_Ensemble_PhaseDiagram`, `Figure_7_Compiled_Predictors`, `Figure_8_Search_Workflow`, and the CSV tables in `data/`.
-- `requirements.txt` - pinned Python package versions.
+- `scripts/gate_level_benchmark.py`
+- `scripts/validate_corrected_results.py`
 
-## Data
+## Validation data
 
-- `data/gate_level_resource_summary.csv` - 6 rows.
-- `data/gate_level_sensitivity_summary.csv` - 64 rows.
-- `data/operator_ensemble_summary.csv` - 768 rows.
-- `data/budgeted_search_summary.csv` - 21 rows.
+- `data/gate_level_resource_summary.csv`
+- `data/gate_level_budget_curves.csv`
+- `data/gate_level_sensitivity_raw.csv`
+- `data/gate_level_sensitivity_budget_metrics.csv`
+- `data/gate_level_sensitivity_budget_summary.csv`
+- `data/operator_ensemble_raw.csv`
+- `data/operator_ensemble_budget_metrics.csv`
+- `data/operator_ensemble_budget_summary.csv`
+- `data/budgeted_search_candidate_stats.csv`
+- `data/budgeted_search_trials.csv`
+- `data/budgeted_search_summary.csv`
+- `data/run_metadata_*.json`
+- `data/validation_report.json`
 
-## Figures
+## Manuscript figures updated by this release
 
-- `figures/Figure_0_Overview.pdf` - conceptual overview schematic.
+- `figures/Figure_0_Overview.pdf`
 - `figures/Figure_1_Variance_Bound.pdf`
 - `figures/Figure_3_Breakeven.pdf`
 - `figures/Figure_4_GateLevel_EndToEnd.pdf`
@@ -26,8 +32,10 @@ This file lists the contents of the public reproducibility artifact.
 - `figures/Figure_7_Compiled_Predictors.pdf`
 - `figures/Figure_8_Search_Workflow.pdf`
 
-## Other files
+## Intentionally omitted unchanged files
 
-- `README.md` - repository overview and reproduction instructions.
-- `.gitignore` - ignores local cache/build artifacts.
-- `checksums_sha256.txt` - SHA256 checksums for all tracked release files.
+- `requirements.txt`
+- `scripts/generate_figures.py`
+- `figures/Figure_0.vsdx`
+
+This minimal release excludes PNG, SVG, and non-manuscript budget-variant figures.

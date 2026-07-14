@@ -1,11 +1,32 @@
 from __future__ import annotations
 
+import argparse
 import csv
+import json
+import logging
+import os
+import platform
+import time
 from dataclasses import asdict, dataclass
+from importlib import metadata
 from pathlib import Path
+
+# Keep the corrected benchmark responsive on a workstation. These defaults
+# can be overridden by the caller before launching Python.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault(
+    "XLA_FLAGS",
+    "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1",
+)
 
 import jax
 import jax.numpy as jnp
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorcircuit as tc
@@ -17,8 +38,12 @@ from tensorcircuit import channels
 
 plt.rcParams.update(
     {
+        # Preserve the visual identity of the previously submitted figures.
+        # Only the corrected data and scientifically necessary labels change.
         "font.family": "serif",
-        "font.serif": ["Computer Modern Roman", "Times New Roman"],
+        "font.serif": ["Computer Modern Roman", "Times New Roman", "DejaVu Serif"],
+        "svg.fonttype": "none",
+        "pdf.fonttype": 42,
         "mathtext.fontset": "cm",
         "axes.labelsize": 12.5,
         "axes.titlesize": 13.5,
@@ -39,6 +64,7 @@ plt.rcParams.update(
 ROOT = Path(__file__).resolve().parents[1]
 FIGURE_DIR = ROOT / "figures"
 DATA_DIR = ROOT / "data"
+LOG_DIR = ROOT / "logs"
 
 COLOR_SPLIT = "#A23B32"
 COLOR_DILATION = "#0B5CAD"
@@ -55,6 +81,8 @@ ONE_QUBIT_DEPOLARIZING = 1.0e-4
 TWO_QUBIT_DEPOLARIZING = 2.0e-3
 ONE_TO_TWO_QUBIT_NOISE_RATIO = ONE_QUBIT_DEPOLARIZING / TWO_QUBIT_DEPOLARIZING
 CNOT_BUDGETS = np.logspace(3.0, 5.0, 220)
+REPORT_CNOT_BUDGETS = np.array([1.0e3, 1.0e4, 1.0e5], dtype=float)
+PRIMARY_CNOT_BUDGET = 1.0e4
 SENSITIVITY_TWO_QUBIT_NOISES = np.array(
     [2.5e-4, 5.0e-4, 1.0e-3, 1.5e-3, 2.0e-3, 3.0e-3, 4.0e-3, 5.0e-3]
 )
@@ -70,6 +98,7 @@ SEARCH_SCORE_PHASE = float(np.arctan(5.0))
 SEARCH_TRIALS = 96
 SEARCH_DENSE_GRID_SIZE = 33
 SEARCH_SEED = 23
+TRANSPILER_SEED = 31
 ZZ_OPERATOR = np.diag([1.0, -1.0, -1.0, 1.0]).astype(complex)
 IDEAL_MATCH_TOLERANCE = 1.0e-6
 
@@ -158,11 +187,12 @@ class SensitivityPoint:
     workload_layers: int
     one_qubit_noise: float
     two_qubit_noise: float
-    split_noisy_factor: float
-    dilation_noisy_factor: float
-    genexp_noisy_factor: float
-    dil_vs_split_noisy_ratio: float
-    dil_vs_genexp_noisy_ratio: float
+    split_noisy_variance: float
+    split_noisy_bias_squared: float
+    dilation_noisy_variance: float
+    dilation_noisy_bias_squared: float
+    genexp_noisy_variance: float
+    genexp_noisy_bias_squared: float
     split_cx_per_shot: float
     dilation_cx_per_shot: float
     genexp_cx_per_shot: float
@@ -176,17 +206,17 @@ class EnsemblePoint:
     two_qubit_noise: float
     operator_ratio: float
     dil_vs_split_ideal_ratio: float
-    dil_vs_split_noisy_ratio: float
     dil_vs_genexp_ideal_ratio: float
-    dil_vs_genexp_noisy_ratio: float
     genexp_vs_split_ideal_ratio: float
-    genexp_vs_split_noisy_ratio: float
     split_ideal_factor: float
     dilation_ideal_factor: float
     genexp_ideal_factor: float
-    split_noisy_factor: float
-    dilation_noisy_factor: float
-    genexp_noisy_factor: float
+    split_noisy_variance: float
+    split_noisy_bias_squared: float
+    dilation_noisy_variance: float
+    dilation_noisy_bias_squared: float
+    genexp_noisy_variance: float
+    genexp_noisy_bias_squared: float
     split_cx_per_shot: float
     dilation_cx_per_shot: float
     genexp_cx_per_shot: float
@@ -212,7 +242,8 @@ def output_directories() -> tuple[Path, ...]:
 def save_figure(fig: plt.Figure, stem: str) -> None:
     for folder in output_directories():
         fig.savefig(folder / f"{stem}.pdf", dpi=300, bbox_inches="tight")
-        fig.savefig(folder / f"{stem}.png", dpi=300, bbox_inches="tight")
+        fig.savefig(folder / f"{stem}.svg", bbox_inches="tight")
+        fig.savefig(folder / f"{stem}.png", dpi=600, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -226,6 +257,34 @@ def save_csv(rows: list[object], filename: str) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(asdict(row))
+
+
+def save_dict_csv(rows: list[dict[str, object]], filename: str) -> None:
+    if not rows:
+        return
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with (DATA_DIR / filename).open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def load_dataclass_csv(filename: str, cls: type) -> list[object]:
+    integer_fields = {"sample_id", "workload_layers", "qubits"}
+    string_fields = {"family", "method"}
+    rows: list[object] = []
+    with (DATA_DIR / filename).open("r", newline="", encoding="utf-8") as handle:
+        for source in csv.DictReader(handle):
+            parsed: dict[str, object] = {}
+            for key, value in source.items():
+                if key in string_fields:
+                    parsed[key] = value
+                elif key in integer_fields:
+                    parsed[key] = int(float(value))
+                else:
+                    parsed[key] = float(value)
+            rows.append(cls(**parsed))
+    return rows
 
 
 def jordan_family(gamma: float) -> np.ndarray:
@@ -268,7 +327,12 @@ def dilation_operator(matrix: np.ndarray) -> np.ndarray:
 
 
 def transpile_instruction_list(circuit: QuantumCircuit) -> tuple[list[tuple[str, list[int], list[float]]], GateCounts]:
-    transpiled = transpile(circuit, basis_gates=["u", "cx"], optimization_level=3)
+    transpiled = transpile(
+        circuit,
+        basis_gates=["u", "cx"],
+        optimization_level=3,
+        seed_transpiler=TRANSPILER_SEED,
+    )
     instructions: list[tuple[str, list[int], list[float]]] = []
     for item in transpiled.data:
         instructions.append(
@@ -767,12 +831,12 @@ def compile_family_benchmark(
         ("dilation", ideal_dilation_mean),
         ("genexp", ideal_genexp_mean),
     ):
-        if abs(mean - ideal_split_mean) > IDEAL_MATCH_TOLERANCE:
+        if abs(mean - direct_target) > IDEAL_MATCH_TOLERANCE:
             raise ValueError(
                 f"Ideal {method_name} realization failed for {family}: "
-                f"|{mean} - {ideal_split_mean}| = {abs(mean - ideal_split_mean)}"
+                f"|{mean} - {direct_target}| = {abs(mean - direct_target)}"
             )
-    target = ideal_split_mean
+    target = direct_target
 
     return CompiledBenchmark(
         family=family,
@@ -911,13 +975,65 @@ def evaluate_compiled_benchmark(
     ]
 
 
-def rmse_curve(mse_factor: float, cx_per_shot: float, budgets: np.ndarray) -> np.ndarray:
-    shots = budgets / cx_per_shot
-    return np.sqrt(mse_factor / shots)
+def shot_count(total_cnot_budget: float, cx_per_shot: float) -> int:
+    return max(1, int(np.floor(total_cnot_budget / cx_per_shot)))
 
 
-def budget_normalized_mse_factor(row: MethodStatistics) -> float:
-    return row.cx_per_shot * (row.noisy_variance + row.noisy_bias_squared)
+def mse_at_budget(
+    variance: float,
+    bias_squared: float,
+    cx_per_shot: float,
+    total_cnot_budget: float,
+) -> float:
+    """MSE of the sample mean under a fixed total CNOT budget.
+
+    Only the random variance is reduced by repeated shots.  The systematic
+    bias remains as a non-vanishing floor.
+    """
+    shots = shot_count(total_cnot_budget, cx_per_shot)
+    return float(variance / shots + bias_squared)
+
+
+def rmse_curve(
+    variance: float,
+    bias_squared: float,
+    cx_per_shot: float,
+    budgets: np.ndarray,
+) -> np.ndarray:
+    budgets = np.asarray(budgets, dtype=float)
+    shots = np.maximum(np.floor(budgets / cx_per_shot), 1.0)
+    return np.sqrt(variance / shots + bias_squared)
+
+
+def point_method_mse(
+    point: SensitivityPoint | EnsemblePoint,
+    method: str,
+    total_cnot_budget: float,
+) -> float:
+    return mse_at_budget(
+        variance=float(getattr(point, f"{method}_noisy_variance")),
+        bias_squared=float(getattr(point, f"{method}_noisy_bias_squared")),
+        cx_per_shot=float(getattr(point, f"{method}_cx_per_shot")),
+        total_cnot_budget=total_cnot_budget,
+    )
+
+
+def point_mse_ratio(
+    point: SensitivityPoint | EnsemblePoint,
+    numerator: str,
+    denominator: str,
+    total_cnot_budget: float,
+) -> float:
+    return point_method_mse(point, numerator, total_cnot_budget) / point_method_mse(
+        point, denominator, total_cnot_budget
+    )
+
+
+def budget_math_label(total_cnot_budget: float) -> str:
+    exponent = int(round(np.log10(total_cnot_budget)))
+    if np.isclose(total_cnot_budget, 10.0**exponent):
+        return rf"10^{{{exponent}}}"
+    return f"{total_cnot_budget:.2g}"
 
 
 def budget_normalized_ideal_factor(row: MethodStatistics) -> float:
@@ -963,9 +1079,15 @@ def plot_gate_level_figure(rows: list[MethodStatistics]) -> None:
     def add_rmse_panel(ax: plt.Axes, family_key: str, title: str) -> None:
         for method, label, _, edge in methods:
             row = grouped[(family_key, method)]
-            ideal_curve = rmse_curve(row.ideal_variance, row.cx_per_shot, CNOT_BUDGETS)
+            ideal_curve = rmse_curve(
+                row.ideal_variance,
+                0.0,
+                row.cx_per_shot,
+                CNOT_BUDGETS,
+            )
             noisy_curve = rmse_curve(
-                row.noisy_variance + row.noisy_bias_squared,
+                row.noisy_variance,
+                row.noisy_bias_squared,
                 row.cx_per_shot,
                 CNOT_BUDGETS,
             )
@@ -990,7 +1112,11 @@ def plot_gate_level_figure(rows: list[MethodStatistics]) -> None:
     save_figure(fig, "Figure_4_GateLevel_EndToEnd")
 
 
-def plot_sensitivity_figure(points: list[SensitivityPoint]) -> None:
+def plot_sensitivity_figure(
+    points: list[SensitivityPoint],
+    total_cnot_budget: float,
+    stem: str,
+) -> None:
     grouped = {
         (point.family, point.workload_layers, point.two_qubit_noise): point
         for point in points
@@ -1004,7 +1130,10 @@ def plot_sensitivity_figure(points: list[SensitivityPoint]) -> None:
         [
             ratio
             for point in points
-            for ratio in (point.dil_vs_split_noisy_ratio, point.dil_vs_genexp_noisy_ratio)
+            for ratio in (
+                point_mse_ratio(point, "dilation", "split", total_cnot_budget),
+                point_mse_ratio(point, "dilation", "genexp", total_cnot_budget),
+            )
         ],
         dtype=float,
     )
@@ -1019,7 +1148,12 @@ def plot_sensitivity_figure(points: list[SensitivityPoint]) -> None:
         dil_vs_split = np.array(
             [
                 [
-                    grouped[(family, layers, noise)].dil_vs_split_noisy_ratio
+                    point_mse_ratio(
+                        grouped[(family, layers, noise)],
+                        "dilation",
+                        "split",
+                        total_cnot_budget,
+                    )
                     for noise in SENSITIVITY_TWO_QUBIT_NOISES
                 ]
                 for layers in SENSITIVITY_WORKLOAD_LAYERS
@@ -1028,7 +1162,12 @@ def plot_sensitivity_figure(points: list[SensitivityPoint]) -> None:
         dil_vs_genexp = np.array(
             [
                 [
-                    grouped[(family, layers, noise)].dil_vs_genexp_noisy_ratio
+                    point_mse_ratio(
+                        grouped[(family, layers, noise)],
+                        "dilation",
+                        "genexp",
+                        total_cnot_budget,
+                    )
                     for noise in SENSITIVITY_TWO_QUBIT_NOISES
                 ]
                 for layers in SENSITIVITY_WORKLOAD_LAYERS
@@ -1077,13 +1216,79 @@ def plot_sensitivity_figure(points: list[SensitivityPoint]) -> None:
 
     colorbar_axis = fig.add_axes([0.915, 0.17, 0.022, 0.64])
     colorbar = fig.colorbar(image, cax=colorbar_axis)
-    colorbar.set_label("Budget-normalized MSE ratio")
-    fig.suptitle(
-        "Sensitivity of coherent dilation against theorem and practical baselines",
-        y=0.98,
-    )
+    colorbar.set_label("Finite-budget MSE ratio")
+    if stem == "Figure_5_GateLevel_Sensitivity":
+        figure_title = "Sensitivity of coherent dilation against theorem and practical baselines"
+    else:
+        figure_title = (
+            rf"Sensitivity of coherent dilation at "
+            rf"$B_{{\rm CX}}={budget_math_label(total_cnot_budget)}$"
+        )
+    fig.suptitle(figure_title, y=0.98)
     fig.subplots_adjust(left=0.08, right=0.89, bottom=0.15, top=0.9, wspace=0.14, hspace=0.18)
-    save_figure(fig, "Figure_5_GateLevel_Sensitivity")
+    save_figure(fig, stem)
+
+
+def save_sensitivity_budget_metrics(points: list[SensitivityPoint]) -> None:
+    rows: list[dict[str, object]] = []
+    for point in points:
+        for budget in REPORT_CNOT_BUDGETS:
+            row: dict[str, object] = {
+                "family": point.family,
+                "workload_layers": point.workload_layers,
+                "one_qubit_noise": point.one_qubit_noise,
+                "two_qubit_noise": point.two_qubit_noise,
+                "total_cnot_budget": float(budget),
+            }
+            for method in ("split", "dilation", "genexp"):
+                cx = float(getattr(point, f"{method}_cx_per_shot"))
+                mse = point_method_mse(point, method, float(budget))
+                row[f"{method}_shots"] = shot_count(float(budget), cx)
+                row[f"{method}_mse"] = mse
+                row[f"{method}_rmse"] = float(np.sqrt(mse))
+            row["dil_vs_split_mse_ratio"] = point_mse_ratio(
+                point, "dilation", "split", float(budget)
+            )
+            row["dil_vs_genexp_mse_ratio"] = point_mse_ratio(
+                point, "dilation", "genexp", float(budget)
+            )
+            rows.append(row)
+    save_dict_csv(rows, "gate_level_sensitivity_budget_metrics.csv")
+
+    summary: list[dict[str, object]] = []
+    for family in sorted({point.family for point in points}):
+        family_points = [point for point in points if point.family == family]
+        for budget in REPORT_CNOT_BUDGETS:
+            split_ratios = np.asarray(
+                [
+                    point_mse_ratio(point, "dilation", "split", float(budget))
+                    for point in family_points
+                ],
+                dtype=float,
+            )
+            genexp_ratios = np.asarray(
+                [
+                    point_mse_ratio(point, "dilation", "genexp", float(budget))
+                    for point in family_points
+                ],
+                dtype=float,
+            )
+            summary.append(
+                {
+                    "family": family,
+                    "total_cnot_budget": float(budget),
+                    "condition_count": len(family_points),
+                    "dil_vs_split_beneficial_fraction": float(np.mean(split_ratios < 1.0)),
+                    "dil_vs_split_median_mse_ratio": float(np.median(split_ratios)),
+                    "dil_vs_split_min_mse_ratio": float(np.min(split_ratios)),
+                    "dil_vs_split_max_mse_ratio": float(np.max(split_ratios)),
+                    "dil_vs_genexp_beneficial_fraction": float(np.mean(genexp_ratios < 1.0)),
+                    "dil_vs_genexp_median_mse_ratio": float(np.median(genexp_ratios)),
+                    "dil_vs_genexp_min_mse_ratio": float(np.min(genexp_ratios)),
+                    "dil_vs_genexp_max_mse_ratio": float(np.max(genexp_ratios)),
+                }
+            )
+    save_dict_csv(summary, "gate_level_sensitivity_budget_summary.csv")
 
 
 def generate_gate_level_sensitivity() -> list[SensitivityPoint]:
@@ -1114,32 +1319,47 @@ def generate_gate_level_sensitivity() -> list[SensitivityPoint]:
                     two_qubit_noise=two_qubit_noise,
                 )
                 row_lookup = {row.method: row for row in rows}
-                split_factor = budget_normalized_mse_factor(row_lookup["split"])
-                dilation_factor = budget_normalized_mse_factor(row_lookup["dilation"])
-                genexp_factor = budget_normalized_mse_factor(row_lookup["genexp"])
                 points.append(
                     SensitivityPoint(
                         family=family,
                         workload_layers=layers,
                         one_qubit_noise=float(one_qubit_noise),
                         two_qubit_noise=float(two_qubit_noise),
-                        split_noisy_factor=float(split_factor),
-                        dilation_noisy_factor=float(dilation_factor),
-                        genexp_noisy_factor=float(genexp_factor),
-                        dil_vs_split_noisy_ratio=float(dilation_factor / split_factor),
-                        dil_vs_genexp_noisy_ratio=float(dilation_factor / genexp_factor),
+                        split_noisy_variance=float(row_lookup["split"].noisy_variance),
+                        split_noisy_bias_squared=float(row_lookup["split"].noisy_bias_squared),
+                        dilation_noisy_variance=float(row_lookup["dilation"].noisy_variance),
+                        dilation_noisy_bias_squared=float(row_lookup["dilation"].noisy_bias_squared),
+                        genexp_noisy_variance=float(row_lookup["genexp"].noisy_variance),
+                        genexp_noisy_bias_squared=float(row_lookup["genexp"].noisy_bias_squared),
                         split_cx_per_shot=float(row_lookup["split"].cx_per_shot),
                         dilation_cx_per_shot=float(row_lookup["dilation"].cx_per_shot),
                         genexp_cx_per_shot=float(row_lookup["genexp"].cx_per_shot),
                     )
                 )
 
-    save_csv(points, "gate_level_sensitivity_summary.csv")
-    plot_sensitivity_figure(points)
+    save_csv(points, "gate_level_sensitivity_raw.csv")
+    save_sensitivity_budget_metrics(points)
+    for budget in REPORT_CNOT_BUDGETS:
+        suffix = f"B{int(budget):d}"
+        plot_sensitivity_figure(
+            points,
+            total_cnot_budget=float(budget),
+            stem=f"Figure_5_GateLevel_Sensitivity_{suffix}",
+        )
+        if budget == PRIMARY_CNOT_BUDGET:
+            plot_sensitivity_figure(
+                points,
+                total_cnot_budget=float(budget),
+                stem="Figure_5_GateLevel_Sensitivity",
+            )
     return points
 
 
-def plot_ensemble_phase_diagram(points: list[EnsemblePoint]) -> None:
+def plot_ensemble_phase_diagram(
+    points: list[EnsemblePoint],
+    total_cnot_budget: float,
+    stem: str,
+) -> None:
     beneficial_split = np.zeros((len(SENSITIVITY_WORKLOAD_LAYERS), len(SENSITIVITY_TWO_QUBIT_NOISES)))
     beneficial_genexp = np.zeros_like(beneficial_split)
     median_split = np.zeros_like(beneficial_split)
@@ -1152,8 +1372,20 @@ def plot_ensemble_phase_diagram(points: list[EnsemblePoint]) -> None:
                 for point in points
                 if point.workload_layers == layers and point.two_qubit_noise == noise
             ]
-            split_ratios = np.array([point.dil_vs_split_noisy_ratio for point in subset], dtype=float)
-            genexp_ratios = np.array([point.dil_vs_genexp_noisy_ratio for point in subset], dtype=float)
+            split_ratios = np.array(
+                [
+                    point_mse_ratio(point, "dilation", "split", total_cnot_budget)
+                    for point in subset
+                ],
+                dtype=float,
+            )
+            genexp_ratios = np.array(
+                [
+                    point_mse_ratio(point, "dilation", "genexp", total_cnot_budget)
+                    for point in subset
+                ],
+                dtype=float,
+            )
             beneficial_split[row_index, col_index] = float(np.mean(split_ratios < 1.0))
             beneficial_genexp[row_index, col_index] = float(np.mean(genexp_ratios < 1.0))
             median_split[row_index, col_index] = float(np.median(split_ratios))
@@ -1211,19 +1443,20 @@ def plot_ensemble_phase_diagram(points: list[EnsemblePoint]) -> None:
                 vmax=float(np.max(median_data)),
             ),
         )
-        axes[1, col_index].set_title(f"Median noisy ratio: {label}")
+        axes[1, col_index].set_title(f"Median finite-budget MSE ratio: {label}")
         axes[1, col_index].set_xlabel(r"Two-qubit noise $p_{2\mathrm{q}}$")
         axes[1, col_index].set_ylabel("Shared workload layers")
 
         for ax in (axes[0, col_index], axes[1, col_index]):
             ax.set_xticks(np.arange(len(SENSITIVITY_TWO_QUBIT_NOISES)))
-            ax.set_xticklabels(
-                [f"{value:.1e}" for value in SENSITIVITY_TWO_QUBIT_NOISES],
-                rotation=35,
-                ha="right",
-            )
             ax.set_yticks(np.arange(len(SENSITIVITY_WORKLOAD_LAYERS)))
             ax.set_yticklabels([str(value) for value in SENSITIVITY_WORKLOAD_LAYERS])
+        axes[0, col_index].set_xticklabels([])
+        axes[1, col_index].set_xticklabels(
+            [f"{value:.1e}" for value in SENSITIVITY_TWO_QUBIT_NOISES],
+            rotation=35,
+            ha="right",
+        )
 
         for inner_row in range(len(SENSITIVITY_WORKLOAD_LAYERS)):
             for inner_col in range(len(SENSITIVITY_TWO_QUBIT_NOISES)):
@@ -1251,20 +1484,43 @@ def plot_ensemble_phase_diagram(points: list[EnsemblePoint]) -> None:
     colorbar_left = fig.colorbar(beneficial_image, cax=cax_top)
     colorbar_left.set_label("Fraction with ratio < 1")
     colorbar_right = fig.colorbar(median_image, cax=cax_bottom)
-    colorbar_right.set_label("Median compiled noisy ratio")
-    fig.suptitle(
-        "Operator-ensemble deployment boundary for coherent dilation against both baselines",
-        y=0.98,
-    )
+    colorbar_right.set_label("Median finite-budget MSE ratio")
+    if stem == "Figure_6_Ensemble_PhaseDiagram":
+        figure_title = (
+            "Operator-ensemble deployment boundary for coherent dilation "
+            "against both baselines"
+        )
+    else:
+        figure_title = (
+            rf"Operator-ensemble boundary at "
+            rf"$B_{{\rm CX}}={budget_math_label(total_cnot_budget)}$"
+        )
+    fig.suptitle(figure_title, y=0.98)
     fig.subplots_adjust(left=0.08, right=0.96, bottom=0.14, top=0.9)
-    save_figure(fig, "Figure_6_Ensemble_PhaseDiagram")
+    save_figure(fig, stem)
 
 
-def plot_predictor_figure(points: list[EnsemblePoint]) -> None:
+def plot_predictor_figure(
+    points: list[EnsemblePoint],
+    total_cnot_budget: float,
+    stem: str,
+) -> None:
     operator_ratios = np.array([point.operator_ratio for point in points], dtype=float)
-    dil_vs_split = np.array([point.dil_vs_split_noisy_ratio for point in points], dtype=float)
+    dil_vs_split = np.array(
+        [
+            point_mse_ratio(point, "dilation", "split", total_cnot_budget)
+            for point in points
+        ],
+        dtype=float,
+    )
     dil_vs_split_ideal = np.array([point.dil_vs_split_ideal_ratio for point in points], dtype=float)
-    dil_vs_genexp = np.array([point.dil_vs_genexp_noisy_ratio for point in points], dtype=float)
+    dil_vs_genexp = np.array(
+        [
+            point_mse_ratio(point, "dilation", "genexp", total_cnot_budget)
+            for point in points
+        ],
+        dtype=float,
+    )
     dil_vs_genexp_ideal = np.array([point.dil_vs_genexp_ideal_ratio for point in points], dtype=float)
     colors = np.array([point.workload_layers for point in points], dtype=float)
 
@@ -1294,8 +1550,8 @@ def plot_predictor_figure(points: list[EnsemblePoint]) -> None:
     )
     axes[0].axhline(1.0, color=COLOR_NEUTRAL, linestyle="--", linewidth=1.2)
     axes[0].set_xlabel(r"Operator-level ratio $R_{\rm split\rightarrow dil}$")
-    axes[0].set_ylabel(r"Noisy ratio $G_{\rm noisy}^{\rm dil/split}$")
-    axes[0].set_title(rf"Operator-only screen ($\rho={corr_operator:.2f}$)")
+    axes[0].set_ylabel(r"Finite-budget MSE ratio, dilation / split")
+    axes[0].set_title(rf"Operator-only screen ($r={corr_operator:.2f}$)")
 
     axes[1].scatter(
         dil_vs_split_ideal,
@@ -1309,8 +1565,8 @@ def plot_predictor_figure(points: list[EnsemblePoint]) -> None:
     axes[1].axhline(1.0, color=COLOR_NEUTRAL, linestyle="--", linewidth=1.2)
     axes[1].axvline(1.0, color=COLOR_NEUTRAL, linestyle=":", linewidth=1.2)
     axes[1].set_xlabel(r"Ideal proxy $G_{\rm ideal}^{\rm dil/split}$")
-    axes[1].set_ylabel(r"Noisy ratio $G_{\rm noisy}^{\rm dil/split}$")
-    axes[1].set_title(rf"Split comparison ($\rho={corr_split_ideal:.2f}$)")
+    axes[1].set_ylabel(r"Finite-budget MSE ratio, dilation / split")
+    axes[1].set_title(rf"Split comparison ($r={corr_split_ideal:.2f}$)")
 
     axes[2].scatter(
         dil_vs_genexp_ideal,
@@ -1324,16 +1580,147 @@ def plot_predictor_figure(points: list[EnsemblePoint]) -> None:
     axes[2].axhline(1.0, color=COLOR_NEUTRAL, linestyle="--", linewidth=1.2)
     axes[2].axvline(1.0, color=COLOR_NEUTRAL, linestyle=":", linewidth=1.2)
     axes[2].set_xlabel(r"Ideal proxy $G_{\rm ideal}^{\rm dil/genexp}$")
-    axes[2].set_ylabel(r"Noisy ratio $G_{\rm noisy}^{\rm dil/genexp}$")
-    axes[2].set_title(rf"Genexp comparison ($\rho={corr_genexp_ideal:.2f}$)")
+    axes[2].set_ylabel(r"Finite-budget MSE ratio, dilation / genexp")
+    axes[2].set_title(rf"Genexp comparison ($r={corr_genexp_ideal:.2f}$)")
 
     fig.colorbar(scatter_left, cax=cax, label="Shared workload layers")
-    fig.suptitle(
-        "Compilation-aware ideal proxies predict deployment far better than the operator-only theorem screen",
-        y=0.98,
-    )
+    if stem == "Figure_7_Compiled_Predictors":
+        figure_title = "Compilation-aware ideal proxies and the operator-only theorem screen"
+    else:
+        figure_title = (
+            rf"Budget-dependent predictor comparison at "
+            rf"$B_{{\rm CX}}={budget_math_label(total_cnot_budget)}$"
+        )
+    fig.suptitle(figure_title, y=0.98)
     fig.subplots_adjust(left=0.06, right=0.97, bottom=0.18, top=0.86)
-    save_figure(fig, "Figure_7_Compiled_Predictors")
+    save_figure(fig, stem)
+
+
+def cluster_bootstrap_correlation(
+    x: np.ndarray,
+    y: np.ndarray,
+    cluster_ids: np.ndarray,
+    seed: int,
+    repetitions: int = 1000,
+) -> tuple[float, float]:
+    unique_ids = np.unique(cluster_ids)
+    cluster_indices = {
+        cluster_id: np.flatnonzero(cluster_ids == cluster_id) for cluster_id in unique_ids
+    }
+    rng = np.random.default_rng(seed)
+    correlations: list[float] = []
+    for _ in range(repetitions):
+        sampled_ids = rng.choice(unique_ids, size=len(unique_ids), replace=True)
+        sampled_indices = np.concatenate(
+            [cluster_indices[cluster_id] for cluster_id in sampled_ids]
+        )
+        sampled_x = x[sampled_indices]
+        sampled_y = y[sampled_indices]
+        if np.std(sampled_x) > 0.0 and np.std(sampled_y) > 0.0:
+            correlations.append(float(np.corrcoef(sampled_x, sampled_y)[0, 1]))
+    if not correlations:
+        return float("nan"), float("nan")
+    return tuple(float(value) for value in np.percentile(correlations, [2.5, 97.5]))
+
+
+def save_ensemble_budget_metrics(points: list[EnsemblePoint]) -> None:
+    rows: list[dict[str, object]] = []
+    for point in points:
+        for budget in REPORT_CNOT_BUDGETS:
+            row: dict[str, object] = {
+                "sample_id": point.sample_id,
+                "workload_layers": point.workload_layers,
+                "one_qubit_noise": point.one_qubit_noise,
+                "two_qubit_noise": point.two_qubit_noise,
+                "total_cnot_budget": float(budget),
+                "operator_ratio": point.operator_ratio,
+                "dil_vs_split_ideal_ratio": point.dil_vs_split_ideal_ratio,
+                "dil_vs_genexp_ideal_ratio": point.dil_vs_genexp_ideal_ratio,
+            }
+            for method in ("split", "dilation", "genexp"):
+                cx = float(getattr(point, f"{method}_cx_per_shot"))
+                mse = point_method_mse(point, method, float(budget))
+                row[f"{method}_shots"] = shot_count(float(budget), cx)
+                row[f"{method}_mse"] = mse
+                row[f"{method}_rmse"] = float(np.sqrt(mse))
+            row["dil_vs_split_mse_ratio"] = point_mse_ratio(
+                point, "dilation", "split", float(budget)
+            )
+            row["dil_vs_genexp_mse_ratio"] = point_mse_ratio(
+                point, "dilation", "genexp", float(budget)
+            )
+            row["genexp_vs_split_mse_ratio"] = point_mse_ratio(
+                point, "genexp", "split", float(budget)
+            )
+            rows.append(row)
+    save_dict_csv(rows, "operator_ensemble_budget_metrics.csv")
+
+    cluster_ids = np.asarray([point.sample_id for point in points], dtype=int)
+    operator_ratios = np.asarray([point.operator_ratio for point in points], dtype=float)
+    ideal_split_ratios = np.asarray(
+        [point.dil_vs_split_ideal_ratio for point in points], dtype=float
+    )
+    ideal_genexp_ratios = np.asarray(
+        [point.dil_vs_genexp_ideal_ratio for point in points], dtype=float
+    )
+    summary: list[dict[str, object]] = []
+    for budget_index, budget in enumerate(REPORT_CNOT_BUDGETS):
+        split_ratios = np.asarray(
+            [
+                point_mse_ratio(point, "dilation", "split", float(budget))
+                for point in points
+            ],
+            dtype=float,
+        )
+        genexp_ratios = np.asarray(
+            [
+                point_mse_ratio(point, "dilation", "genexp", float(budget))
+                for point in points
+            ],
+            dtype=float,
+        )
+        corr_operator = float(np.corrcoef(operator_ratios, split_ratios)[0, 1])
+        corr_split_ideal = float(np.corrcoef(ideal_split_ratios, split_ratios)[0, 1])
+        corr_genexp_ideal = float(np.corrcoef(ideal_genexp_ratios, genexp_ratios)[0, 1])
+        operator_ci = cluster_bootstrap_correlation(
+            operator_ratios,
+            split_ratios,
+            cluster_ids,
+            seed=100 + budget_index,
+        )
+        split_ci = cluster_bootstrap_correlation(
+            ideal_split_ratios,
+            split_ratios,
+            cluster_ids,
+            seed=200 + budget_index,
+        )
+        genexp_ci = cluster_bootstrap_correlation(
+            ideal_genexp_ratios,
+            genexp_ratios,
+            cluster_ids,
+            seed=300 + budget_index,
+        )
+        summary.append(
+            {
+                "total_cnot_budget": float(budget),
+                "operator_count": len(np.unique(cluster_ids)),
+                "compiled_condition_count": len(points),
+                "dil_vs_split_beneficial_fraction": float(np.mean(split_ratios < 1.0)),
+                "dil_vs_split_median_mse_ratio": float(np.median(split_ratios)),
+                "dil_vs_genexp_beneficial_fraction": float(np.mean(genexp_ratios < 1.0)),
+                "dil_vs_genexp_median_mse_ratio": float(np.median(genexp_ratios)),
+                "corr_operator_vs_dil_split": corr_operator,
+                "corr_operator_ci_low": operator_ci[0],
+                "corr_operator_ci_high": operator_ci[1],
+                "corr_ideal_split_vs_dil_split": corr_split_ideal,
+                "corr_ideal_split_ci_low": split_ci[0],
+                "corr_ideal_split_ci_high": split_ci[1],
+                "corr_ideal_genexp_vs_dil_genexp": corr_genexp_ideal,
+                "corr_ideal_genexp_ci_low": genexp_ci[0],
+                "corr_ideal_genexp_ci_high": genexp_ci[1],
+            }
+        )
+    save_dict_csv(summary, "operator_ensemble_budget_summary.csv")
 
 
 def generate_operator_ensemble_artifacts() -> list[EnsemblePoint]:
@@ -1374,9 +1761,6 @@ def generate_operator_ensemble_artifacts() -> list[EnsemblePoint]:
                     two_qubit_noise=two_qubit_noise,
                 )
                 row_lookup = {row.method: row for row in rows}
-                split_noisy_factor = budget_normalized_mse_factor(row_lookup["split"])
-                dilation_noisy_factor = budget_normalized_mse_factor(row_lookup["dilation"])
-                genexp_noisy_factor = budget_normalized_mse_factor(row_lookup["genexp"])
                 points.append(
                     EnsemblePoint(
                         sample_id=sample_id,
@@ -1385,26 +1769,48 @@ def generate_operator_ensemble_artifacts() -> list[EnsemblePoint]:
                         two_qubit_noise=float(two_qubit_noise),
                         operator_ratio=float(ratio),
                         dil_vs_split_ideal_ratio=float(dilation_ideal_factor / split_ideal_factor),
-                        dil_vs_split_noisy_ratio=float(dilation_noisy_factor / split_noisy_factor),
                         dil_vs_genexp_ideal_ratio=float(dilation_ideal_factor / genexp_ideal_factor),
-                        dil_vs_genexp_noisy_ratio=float(dilation_noisy_factor / genexp_noisy_factor),
                         genexp_vs_split_ideal_ratio=float(genexp_ideal_factor / split_ideal_factor),
-                        genexp_vs_split_noisy_ratio=float(genexp_noisy_factor / split_noisy_factor),
                         split_ideal_factor=float(split_ideal_factor),
                         dilation_ideal_factor=float(dilation_ideal_factor),
                         genexp_ideal_factor=float(genexp_ideal_factor),
-                        split_noisy_factor=float(split_noisy_factor),
-                        dilation_noisy_factor=float(dilation_noisy_factor),
-                        genexp_noisy_factor=float(genexp_noisy_factor),
+                        split_noisy_variance=float(row_lookup["split"].noisy_variance),
+                        split_noisy_bias_squared=float(row_lookup["split"].noisy_bias_squared),
+                        dilation_noisy_variance=float(row_lookup["dilation"].noisy_variance),
+                        dilation_noisy_bias_squared=float(row_lookup["dilation"].noisy_bias_squared),
+                        genexp_noisy_variance=float(row_lookup["genexp"].noisy_variance),
+                        genexp_noisy_bias_squared=float(row_lookup["genexp"].noisy_bias_squared),
                         split_cx_per_shot=float(row_lookup["split"].cx_per_shot),
                         dilation_cx_per_shot=float(row_lookup["dilation"].cx_per_shot),
                         genexp_cx_per_shot=float(row_lookup["genexp"].cx_per_shot),
                     )
                 )
 
-    save_csv(points, "operator_ensemble_summary.csv")
-    plot_ensemble_phase_diagram(points)
-    plot_predictor_figure(points)
+    save_csv(points, "operator_ensemble_raw.csv")
+    save_ensemble_budget_metrics(points)
+    for budget in REPORT_CNOT_BUDGETS:
+        suffix = f"B{int(budget):d}"
+        plot_ensemble_phase_diagram(
+            points,
+            total_cnot_budget=float(budget),
+            stem=f"Figure_6_Ensemble_PhaseDiagram_{suffix}",
+        )
+        plot_predictor_figure(
+            points,
+            total_cnot_budget=float(budget),
+            stem=f"Figure_7_Compiled_Predictors_{suffix}",
+        )
+        if budget == PRIMARY_CNOT_BUDGET:
+            plot_ensemble_phase_diagram(
+                points,
+                total_cnot_budget=float(budget),
+                stem="Figure_6_Ensemble_PhaseDiagram",
+            )
+            plot_predictor_figure(
+                points,
+                total_cnot_budget=float(budget),
+                stem="Figure_7_Compiled_Predictors",
+            )
     return points
 
 
@@ -1626,14 +2032,37 @@ def generate_budgeted_search_artifacts() -> list[SearchBudgetPoint]:
 
     rng = np.random.default_rng(SEARCH_SEED)
     rows: list[SearchBudgetPoint] = []
+    candidate_rows: list[dict[str, object]] = []
+    for schedule_index, point in enumerate(schedule):
+        for method in ("split", "dilation", "genexp"):
+            mean_score, variance_score = noisy_stats[point][method]
+            candidate_rows.append(
+                {
+                    "schedule_index": schedule_index,
+                    "theta_1": point[0],
+                    "theta_2": point[1],
+                    "method": method,
+                    "true_score": true_scores[point],
+                    "noisy_mean_score": mean_score,
+                    "noisy_per_shot_variance": variance_score,
+                    "cx_cost_per_evaluation": {
+                        "split": benchmarks[point].split_counts.cx_gates,
+                        "dilation": benchmarks[point].dilation_counts.cx_gates,
+                        "genexp": benchmarks[point].genexp_counts.cx_gates,
+                    }[method],
+                }
+            )
+
+    trial_rows: list[dict[str, object]] = []
     for method in ("split", "dilation", "genexp"):
         for budget in SEARCH_BUDGETS:
             shots_per_eval = max(1, int(np.floor(budget / schedule_costs[method])))
             reported_best_scores: list[float] = []
             selected_true_scores: list[float] = []
-            for _ in range(SEARCH_TRIALS):
+            for trial_id in range(SEARCH_TRIALS):
                 best_estimate = -np.inf
                 best_true_score = -np.inf
+                best_point = schedule[0]
                 for point in schedule:
                     mean_score, variance_score = noisy_stats[point][method]
                     estimate = float(
@@ -1645,8 +2074,24 @@ def generate_budgeted_search_artifacts() -> list[SearchBudgetPoint]:
                     if estimate > best_estimate:
                         best_estimate = estimate
                         best_true_score = true_scores[point]
+                        best_point = point
                 reported_best_scores.append(best_estimate)
                 selected_true_scores.append(best_true_score)
+                trial_rows.append(
+                    {
+                        "method": method,
+                        "total_cnot_budget": float(budget),
+                        "trial_id": trial_id,
+                        "shots_per_evaluation": shots_per_eval,
+                        "schedule_cx_cost": float(schedule_costs[method]),
+                        "selected_theta_1": best_point[0],
+                        "selected_theta_2": best_point[1],
+                        "reported_best_score": best_estimate,
+                        "selected_true_score": best_true_score,
+                        "dense_grid_optimum_score": optimum_score,
+                        "regret": optimum_score - best_true_score,
+                    }
+                )
 
             reported_array = np.asarray(reported_best_scores, dtype=float)
             selected_array = np.asarray(selected_true_scores, dtype=float)
@@ -1663,12 +2108,42 @@ def generate_budgeted_search_artifacts() -> list[SearchBudgetPoint]:
                 )
             )
 
+    save_dict_csv(candidate_rows, "budgeted_search_candidate_stats.csv")
+    save_dict_csv(trial_rows, "budgeted_search_trials.csv")
     save_csv(rows, "budgeted_search_summary.csv")
     plot_budgeted_search_figure(rows, optimum_score)
     return rows
 
 
-def generate_gate_level_artifacts() -> list[MethodStatistics]:
+def save_gate_level_budget_metrics(rows: list[MethodStatistics]) -> None:
+    output: list[dict[str, object]] = []
+    for row in rows:
+        for budget in CNOT_BUDGETS:
+            shots = shot_count(float(budget), row.cx_per_shot)
+            ideal_mse = float(row.ideal_variance / shots)
+            noisy_mse = mse_at_budget(
+                row.noisy_variance,
+                row.noisy_bias_squared,
+                row.cx_per_shot,
+                float(budget),
+            )
+            output.append(
+                {
+                    "family": row.family,
+                    "method": row.method,
+                    "total_cnot_budget": float(budget),
+                    "shots": shots,
+                    "ideal_mse": ideal_mse,
+                    "ideal_rmse": float(np.sqrt(ideal_mse)),
+                    "noisy_mse": noisy_mse,
+                    "noisy_rmse": float(np.sqrt(noisy_mse)),
+                    "noisy_bias_squared": row.noisy_bias_squared,
+                }
+            )
+    save_dict_csv(output, "gate_level_budget_curves.csv")
+
+
+def generate_baseline_artifacts() -> list[MethodStatistics]:
     rows = []
     compiled_benchmarks = [
         compile_family_benchmark("jordan_gamma_1", jordan_family(1.0)),
@@ -1683,12 +2158,198 @@ def generate_gate_level_artifacts() -> list[MethodStatistics]:
             )
         )
     save_csv(rows, "gate_level_resource_summary.csv")
+    save_gate_level_budget_metrics(rows)
     plot_gate_level_figure(rows)
+    return rows
+
+
+def generate_gate_level_artifacts() -> list[MethodStatistics]:
+    rows = generate_baseline_artifacts()
     generate_gate_level_sensitivity()
     generate_operator_ensemble_artifacts()
     generate_budgeted_search_artifacts()
     return rows
 
 
+def plot_baseline_from_data() -> None:
+    rows = load_dataclass_csv("gate_level_resource_summary.csv", MethodStatistics)
+    save_gate_level_budget_metrics(rows)
+    plot_gate_level_figure(rows)
+
+
+def plot_sensitivity_from_data() -> None:
+    points = load_dataclass_csv("gate_level_sensitivity_raw.csv", SensitivityPoint)
+    save_sensitivity_budget_metrics(points)
+    for budget in REPORT_CNOT_BUDGETS:
+        suffix = f"B{int(budget):d}"
+        plot_sensitivity_figure(
+            points,
+            total_cnot_budget=float(budget),
+            stem=f"Figure_5_GateLevel_Sensitivity_{suffix}",
+        )
+        if budget == PRIMARY_CNOT_BUDGET:
+            plot_sensitivity_figure(
+                points,
+                total_cnot_budget=float(budget),
+                stem="Figure_5_GateLevel_Sensitivity",
+            )
+
+
+def plot_ensemble_from_data() -> None:
+    points = load_dataclass_csv("operator_ensemble_raw.csv", EnsemblePoint)
+    save_ensemble_budget_metrics(points)
+    for budget in REPORT_CNOT_BUDGETS:
+        suffix = f"B{int(budget):d}"
+        plot_ensemble_phase_diagram(
+            points,
+            total_cnot_budget=float(budget),
+            stem=f"Figure_6_Ensemble_PhaseDiagram_{suffix}",
+        )
+        plot_predictor_figure(
+            points,
+            total_cnot_budget=float(budget),
+            stem=f"Figure_7_Compiled_Predictors_{suffix}",
+        )
+        if budget == PRIMARY_CNOT_BUDGET:
+            plot_ensemble_phase_diagram(
+                points,
+                total_cnot_budget=float(budget),
+                stem="Figure_6_Ensemble_PhaseDiagram",
+            )
+            plot_predictor_figure(
+                points,
+                total_cnot_budget=float(budget),
+                stem="Figure_7_Compiled_Predictors",
+            )
+
+
+def plot_all_from_data() -> None:
+    plot_baseline_from_data()
+    plot_sensitivity_from_data()
+    plot_ensemble_from_data()
+
+
+def package_version(distribution: str) -> str:
+    try:
+        return metadata.version(distribution)
+    except metadata.PackageNotFoundError:
+        return "not installed"
+
+
+def configure_logging(stage: str) -> tuple[logging.Logger, Path]:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_path = LOG_DIR / f"run_{timestamp}_{stage}.log"
+    logger = logging.getLogger("corrected_nonlinear_benchmark")
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger, log_path
+
+
+def write_run_metadata(
+    stage: str,
+    status: str,
+    duration_seconds: float,
+    log_path: Path,
+) -> Path:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    metadata_path = DATA_DIR / f"run_metadata_{stage}.json"
+    payload = {
+        "stage": stage,
+        "status": status,
+        "duration_seconds": duration_seconds,
+        "log_file": str(log_path.relative_to(ROOT)),
+        "mse_definition": "variance / floor(total_cnot_budget / cx_per_shot) + bias_squared",
+        "report_cnot_budgets": REPORT_CNOT_BUDGETS.tolist(),
+        "primary_cnot_budget": PRIMARY_CNOT_BUDGET,
+        "transpiler_seed": TRANSPILER_SEED,
+        "ensemble_seed": ENSEMBLE_SEED,
+        "search_seed": SEARCH_SEED,
+        "cpu_thread_limits": {
+            key: os.environ.get(key)
+            for key in (
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+                "XLA_FLAGS",
+            )
+        },
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "packages": {
+            "tensorcircuit": package_version("tensorcircuit"),
+            "jax": package_version("jax"),
+            "jaxlib": package_version("jaxlib"),
+            "numpy": package_version("numpy"),
+            "scipy": package_version("scipy"),
+            "matplotlib": package_version("matplotlib"),
+            "qiskit": package_version("qiskit"),
+        },
+    }
+    metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return metadata_path
+
+
+def run_stage(stage: str) -> None:
+    stage_functions = {
+        "baseline": generate_baseline_artifacts,
+        "sensitivity": generate_gate_level_sensitivity,
+        "ensemble": generate_operator_ensemble_artifacts,
+        "search": generate_budgeted_search_artifacts,
+        "plot-baseline": plot_baseline_from_data,
+        "plot-sensitivity": plot_sensitivity_from_data,
+        "plot-ensemble": plot_ensemble_from_data,
+        "plot-all": plot_all_from_data,
+        "all": generate_gate_level_artifacts,
+    }
+    logger, log_path = configure_logging(stage)
+    start = time.perf_counter()
+    status = "completed"
+    logger.info("Starting corrected experiment stage: %s", stage)
+    logger.info("MSE = variance / shots + bias_squared; shots = floor(B_CX / C_X per shot)")
+    logger.info("Thread limits: OMP=%s, MKL=%s, XLA=%s", os.environ.get("OMP_NUM_THREADS"), os.environ.get("MKL_NUM_THREADS"), os.environ.get("XLA_FLAGS"))
+    try:
+        stage_functions[stage]()
+    except Exception:
+        status = "failed"
+        logger.exception("Corrected experiment stage failed: %s", stage)
+        raise
+    finally:
+        duration = time.perf_counter() - start
+        metadata_path = write_run_metadata(stage, status, duration, log_path)
+        logger.info("Stage %s finished with status=%s in %.1f seconds", stage, status, duration)
+        logger.info("Run metadata: %s", metadata_path)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Corrected nonlinear QSP gate-level benchmark")
+    parser.add_argument(
+        "--stage",
+        choices=(
+            "baseline",
+            "sensitivity",
+            "ensemble",
+            "search",
+            "plot-baseline",
+            "plot-sensitivity",
+            "plot-ensemble",
+            "plot-all",
+            "all",
+        ),
+        default="all",
+        help="Run one isolated stage or the full corrected pipeline.",
+    )
+    args = parser.parse_args()
+    run_stage(args.stage)
+
+
 if __name__ == "__main__":
-    generate_gate_level_artifacts()
+    main()
