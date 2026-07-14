@@ -184,7 +184,7 @@ def plot_variance_ratio_landscape() -> None:
         y=1.02,
     )
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.965))
-    save_figure(fig, "Figure_1_Variance_Bound")
+    save_figure(fig, "Figure_2_Variance_Bound")
     plt.close(fig)
 
 

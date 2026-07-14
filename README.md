@@ -1,36 +1,55 @@
-# Corrected finite-budget update
+# Reproducibility artifact for nonnormal measurement blocks
 
-This is the minimal GitHub update for the revised manuscript, *Unitary Dilation Based Coherent Realization of Nonnormal Measurement Blocks in Quantum Weighted State Algorithms*. It replaces the affected compiled results without duplicating unchanged repository files.
+This repository contains the code and numerical artifacts for the manuscript:
 
-For a route \(m\), the corrected finite-budget analysis uses
+**Unitary Dilation Based Coherent Realization of Nonnormal Measurement Blocks in Quantum Weighted State Algorithms**
 
-```text
-s_m(B_CX)   = max(1, floor(B_CX / n_CX,m))
-MSE_m(B_CX) = v_m / s_m(B_CX) + b_m^2
-RMSE_m      = sqrt(MSE_m)
+## Repository contents
+
+- `scripts/generate_figures.py` regenerates the operator-level computational figures used in the manuscript: `Figure_2_Variance_Bound` and `Figure_3_Breakeven`.
+- `scripts/gate_level_benchmark.py` regenerates the gate-level benchmark figures, `Figure_4_GateLevel_EndToEnd` through `Figure_8_Search_Workflow`, together with the associated tables in `data/`.
+- `scripts/validate_corrected_results.py` checks the consistency of the released numerical tables and figure files.
+- `data/` contains the resource summary, finite-budget curves, sensitivity and ensemble records, search records, run metadata, and validation report.
+- `figures/` contains the final PDF figures used in the manuscript. `Figure_1_Overview.pdf` is the conceptual overview schematic, and `Figure_1_Overview.vsdx` is its editable Visio source.
+- `requirements.txt` lists the Python dependencies used for the artifact.
+
+## Reproducing the artifacts
+
+Create a clean Python environment and install the dependencies:
+
+```bash
+python -m venv .venv
+# Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
-The noise-induced squared-bias term is not divided by the number of shots.
+Regenerate the operator-level figures:
 
-## Included files
+```bash
+python scripts/generate_figures.py
+```
 
-- `scripts/gate_level_benchmark.py` regenerates the corrected finite-budget analyses.
-- `scripts/validate_corrected_results.py` independently recomputes and checks the reported finite-budget metrics from the raw tables.
-- `data/` contains the route-specific variance, squared bias, CNOT cost, budget-specific metrics, ensemble records, search records, run metadata, and the validation report.
-- `figures/` contains the eight manuscript PDFs required by the revised paper: Figure 1 overview, the restored Figures 1 and 3, and corrected Figures 4--8.
+Run the gate-level benchmark pipeline:
 
-The existing repository files `requirements.txt`, `scripts/generate_figures.py`, and `figures/Figure_0.vsdx` are unchanged and are intentionally not duplicated in this update. Figures 1 and 3 are included solely because they are missing from the current public repository and must be restored.
+```bash
+python scripts/gate_level_benchmark.py --stage all
+```
 
-## Verification
+Check the released numerical artifacts:
 
-After uploading this update to the existing repository, install the repository's pinned dependencies and run:
-
-```powershell
+```bash
 python scripts/validate_corrected_results.py
 ```
 
-The expected result is `"status": "passed"` with no errors. The validation script checks the raw-to-budget aggregation for the named-family, sensitivity, ensemble, and search analyses.
+The gate-level pipeline performs Qiskit transpilation and TensorCircuit/JAX simulations and is therefore slower than the operator-level figure script. Running either generation script overwrites its corresponding files in `figures/` and `data/`.
 
-## Scope
+## Reproducibility parameters
 
-Figures 4--7 are basis-transpiled simulations under the stated simulated depolarizing-noise model. They are not hardware-backend measurements.
+The manuscript-relevant deterministic settings are encoded in the scripts:
+
+- Random survey for `Figure_2_Variance_Bound`: 5000 complex 2 by 2 matrices, `seed=7`.
+- Compiled ensemble: 24 complex 2 by 2 matrices, spectral norm 2, `ENSEMBLE_SEED=17`.
+- Sensitivity grid: workload depths `1, 2, 3, 4` and two-qubit noise values from `2.5e-4` to `5.0e-3`.
+- Budgeted search: seven CNOT budgets, 96 repeated trials per budget, `SEARCH_SEED=23`.
+- Transpilation target: Qiskit optimization level 3 to the native `{u, cx}` basis.
